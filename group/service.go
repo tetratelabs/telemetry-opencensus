@@ -62,8 +62,9 @@ const (
 )
 
 type Config struct {
-	// ExternalPromWebHandler will disable the ability to configure Prometheus
-	// exporter from this group Config handler, as it is handled externally.
+	// ExternalPromWebHandler will disable the ability to configure and run the
+	// Prometheus exporter from this group Config handler, as it is handled
+	// externally.
 	ExternalPromWebHandler bool
 
 	// NoPrometheus will disable configuring the Prometheus exporter in favor.
@@ -148,6 +149,8 @@ func (s *service) FlagSet() *run.FlagSet {
 			"endpoint to serve Prometheus from")
 		fs.StringVar(&s.config.PrometheusNamespace, PrometheusNamespace, s.config.PrometheusNamespace,
 			"namespace (prefix) for Prometheus metrics")
+	} else {
+		s.config.NoPrometheus = true
 	}
 
 	if s.config.OpenCensusAddress == "" {
@@ -181,7 +184,7 @@ func (s *service) FlagSet() *run.FlagSet {
 func (s service) Validate() error {
 	var mErr error
 
-	if !s.config.ExternalPromWebHandler && !s.config.NoPrometheus {
+	if !s.config.NoPrometheus {
 		if _, _, err := net.SplitHostPort(s.config.PrometheusAddress); err != nil {
 			mErr = multierror.Append(mErr,
 				fmt.Errorf(flagErr, PrometheusAddress, err))
@@ -206,7 +209,7 @@ func (s service) Validate() error {
 func (s *service) PreRun() error {
 	s.close = make(chan struct{})
 
-	if !s.config.ExternalPromWebHandler && !s.config.NoPrometheus {
+	if !s.config.NoPrometheus {
 		var err error
 		if s.prometheus, err = prometheus.NewExporter(prometheus.Options{}); err != nil {
 			return fmt.Errorf("could not set up Prometheus exporter: %v", err)
@@ -230,7 +233,7 @@ func (s *service) PreRun() error {
 
 // Serve implements run.Service.
 func (s *service) Serve() error {
-	if !s.config.ExternalPromWebHandler && !s.config.NoPrometheus {
+	if !s.config.NoPrometheus {
 		m := http.NewServeMux()
 		m.Handle(s.config.PrometheusEndpoint, s.prometheus)
 		s.server = &http.Server{Handler: m}
@@ -256,7 +259,11 @@ func (s *service) Serve() error {
 
 // GracefulStop implements run.Service.
 func (s *service) GracefulStop() {
-	_ = s.forwarder.Stop()
-	_ = s.listen.Close()
+	if s.forwarder != nil {
+		_ = s.forwarder.Stop()
+	}
+	if s.listen != nil {
+		_ = s.listen.Close()
+	}
 	close(s.close)
 }
