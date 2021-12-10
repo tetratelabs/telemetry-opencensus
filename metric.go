@@ -12,10 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package implementation
+// Package opencensus provides a tetratelabs/telemetry compatible metrics
+// implementation based on OpenCensus.
+package opencensus
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/tetratelabs/telemetry"
 	"go.opencensus.io/stats"
@@ -23,8 +26,8 @@ import (
 	"go.opencensus.io/tag"
 )
 
-// NewMetricSink returns a new Telemetry facade compatible MetricSink.
-func NewMetricSink(logger telemetry.Logger) telemetry.MetricSink {
+// New returns a new Telemetry facade compatible MetricSink.
+func New(logger telemetry.Logger) telemetry.MetricSink {
 	return metricSink{logger: logger}
 }
 
@@ -32,55 +35,25 @@ type metricSink struct {
 	logger telemetry.Logger
 }
 
-func convertOptions(opts []telemetry.MetricOption) *metricOptions {
-	from := &telemetry.MetricOptions{Unit: "1"}
-	to := &metricOptions{}
-
-	for _, opt := range opts {
-		opt(from)
-	}
-
-	switch from.Unit {
-	case telemetry.None:
-		to.unit = string(telemetry.None)
-	case telemetry.Bytes:
-		to.unit = string(telemetry.Bytes)
-	case telemetry.Seconds:
-		to.unit = string(telemetry.Seconds)
-	case telemetry.Milliseconds:
-		to.unit = string(telemetry.Milliseconds)
-	default:
-		to.unit = string(telemetry.None)
-	}
-	to.tagKeys = make([]tag.Key, 0, len(from.Labels))
-	for _, l := range from.Labels {
-		to.tagKeys = append(to.tagKeys, l.(*labelImpl).label)
-	}
-	return to
-}
-
 // NewSum creates a new Metric with an aggregation type of Sum (the values will
 // be cumulative). That means that data collected by the new Metric will be
 // summed before export.
 func (m metricSink) NewSum(name, description string, opts ...telemetry.MetricOption) telemetry.Metric {
-	mo := convertOptions(opts)
-	return m.newFloat64Metric(name, description, view.Sum(), mo)
+	return m.newFloat64Metric(name, description, view.Sum(), opts)
 }
 
 // NewGauge creates a new Metric with an aggregation type of LastValue. That
 // means that data collected by the new Metric will export only the last
 // recorded value.
 func (m metricSink) NewGauge(name, description string, opts ...telemetry.MetricOption) telemetry.Metric {
-	mo := convertOptions(opts)
-	return m.newFloat64Metric(name, description, view.LastValue(), mo)
+	return m.newFloat64Metric(name, description, view.LastValue(), opts)
 }
 
 // NewDistribution creates a new Metric with an aggregation type of Distribution.
 // This means that the data collected by the Metric will be collected and
 // exported as a histogram, with the specified bounds.
 func (m metricSink) NewDistribution(name, description string, bounds []float64, opts ...telemetry.MetricOption) telemetry.Metric {
-	mo := convertOptions(opts)
-	return m.newFloat64Metric(name, description, view.Distribution(bounds...), mo)
+	return m.newFloat64Metric(name, description, view.Distribution(bounds...), opts)
 }
 
 // NewLabel creates a new Label to be used as a metrics dimension.
@@ -110,18 +83,22 @@ type labelImpl struct {
 	label tag.Key
 }
 
+// Insert will insert the provided value for the Label if not set.
 func (l labelImpl) Insert(val string) telemetry.LabelValue {
 	return tag.Insert(l.label, val)
 }
 
+// Update will update the Label with provided value if already set.
 func (l labelImpl) Update(val string) telemetry.LabelValue {
 	return tag.Update(l.label, val)
 }
 
+// Upsert will insert or replace the provided value for the Label.
 func (l labelImpl) Upsert(val string) telemetry.LabelValue {
 	return tag.Upsert(l.label, val)
 }
 
+// Delete will remove the Label's value.
 func (l labelImpl) Delete() telemetry.LabelValue {
 	return tag.Delete(l.label)
 }
@@ -131,6 +108,8 @@ type float64Metric struct {
 
 	tags []tag.Mutator
 	view *view.View
+
+	logger telemetry.Logger
 }
 
 type metricOptions struct {
@@ -138,42 +117,81 @@ type metricOptions struct {
 	tagKeys []tag.Key
 }
 
-func (m metricSink) newFloat64Metric(name, description string, aggr *view.Aggregation, o *metricOptions) *float64Metric {
-	measure := stats.Float64(name, description, o.unit)
-	tagKeys := make([]tag.Key, 0, len(o.tagKeys))
-
-	for _, k := range o.tagKeys {
-		tagKeys = append(tagKeys, k)
+func (m metricSink) newFloat64Metric(name, desc string, a *view.Aggregation, opts []telemetry.MetricOption) *float64Metric {
+	from := &telemetry.MetricOptions{Unit: "1"}
+	for _, opt := range opts {
+		opt(from)
 	}
-
-	newView := &view.View{Measure: measure, TagKeys: tagKeys, Aggregation: aggr}
-	if err := view.Register(newView); err != nil {
+	o := &metricOptions{
+		unit:    string(from.Unit),
+		tagKeys: make([]tag.Key, 0, len(from.Labels)),
+	}
+	for _, l := range from.Labels {
+		o.tagKeys = append(o.tagKeys, l.(*labelImpl).label)
+	}
+	measure := stats.Float64(name, desc, o.unit)
+	newView := &view.View{Measure: measure, TagKeys: o.tagKeys, Aggregation: a}
+	err := view.Register(newView)
+	if err != nil && m.logger != nil {
 		m.logger.Error("unable to register metric view", err)
 	}
 
-	return &float64Metric{measure, make([]tag.Mutator, 0), newView}
+	return &float64Metric{
+		measure,
+		make([]tag.Mutator, 0),
+		newView,
+		m.logger,
+	}
 }
 
+// Increment records a value of 1 for the current Metric.
+// For Sums, this is equivalent to adding 1 to the current value.
+// For Gauges, this is equivalent to setting the value to 1.
+// For Distributions, this is equivalent to making an observation of value 1.
 func (f *float64Metric) Increment() {
 	f.Record(1)
 }
 
+// Decrement records a value of -1 for the current Metric.
+// For Sums, this is equivalent to subtracting -1 to the current value.
+// For Gauges, this is equivalent to setting the value to -1.
+// For Distributions, this is equivalent to making an observation of value -1.
 func (f *float64Metric) Decrement() {
 	f.Record(-1)
 }
 
+// Name returns the name value of a Metric.
 func (f *float64Metric) Name() string {
 	return f.Float64Measure.Name()
 }
 
+// Record makes an observation of the provided value for the given Metric.
+// LabelValues added through With will be processed in sequence.
 func (f *float64Metric) Record(value float64) {
-	_ = stats.RecordWithTags(context.Background(), f.tags, f.M(value))
+	err := stats.RecordWithTags(context.Background(), f.tags, f.M(value))
+	if err != nil && f.logger != nil {
+		f.logger.Error("unable to record with tags", err,
+			"tags", fmt.Sprintf("%+v", f.tags))
+	}
 }
 
+// RecordContext makes an observation of the provided value for the given
+// Metric.
+// If LabelValues for registered Labels are found in context, they will be
+// processed in sequence, after which the LabelValues added through With
+// are handled.
 func (f *float64Metric) RecordContext(ctx context.Context, value float64) {
-	_ = stats.RecordWithTags(ctx, f.tags, f.M(value))
+	err := stats.RecordWithTags(ctx, f.tags, f.M(value))
+	if err != nil && f.logger != nil {
+		f.logger.Error("unable to record with tags", err,
+			"tags", fmt.Sprintf("%+v", f.tags))
+	}
 }
 
+// With returns the Metric with the provided LabelValues encapsulated. This
+// allows creating a set of pre-dimensioned data for recording purposes.
+// It also allows a way to clear out LabelValues found in an attached
+// Context if needing to sanitize.
 func (f *float64Metric) With(labelValues ...telemetry.LabelValue) telemetry.Metric {
 	if len(labelValues) == 0 {
 		return f
@@ -183,12 +201,5 @@ func (f *float64Metric) With(labelValues ...telemetry.LabelValue) telemetry.Metr
 	for _, tagValue := range labelValues {
 		tags = append(tags, tagValue.(tag.Mutator))
 	}
-	return &float64Metric{f.Float64Measure, tags, f.view}
-}
-
-// ToLogger takes a Logger and returns a Logger interface which will
-// emit an Increment() on Logger.Info and Logger.Error calls for this
-// metric.
-func (f *float64Metric) ToLogger(logger telemetry.Logger) telemetry.Logger {
-	return logger.Metric(f)
+	return &float64Metric{f.Float64Measure, tags, f.view, f.logger}
 }
